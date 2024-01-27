@@ -16,8 +16,7 @@ import (
 )
 
 const (
-	TypeOCI  = "oci"
-	TypeDart = "dart"
+	TypeOCI = "oci"
 
 	// TypeK8s is a custom type for Kubernetes components in PURL.
 	//  - namespace: The service provider such as EKS or GKE. It is not case sensitive and must be lowercased.
@@ -49,66 +48,125 @@ type PackageURL struct {
 	FilePath string
 }
 
-func FromString(purl string) (*PackageURL, error) {
-	p, err := packageurl.FromString(purl)
+func FromString(s string) (*PackageURL, error) {
+	p, err := packageurl.FromString(s)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to parse purl(%s): %w", purl, err)
+		return nil, xerrors.Errorf("failed to parse purl(%s): %w", s, err)
+	}
+
+	// Take out and delete the file path from qualifiers
+	var filePath string
+	for i, q := range p.Qualifiers {
+		if q.Key != "file_path" {
+			continue
+		}
+		filePath = q.Value
+		p.Qualifiers = append(p.Qualifiers[:i], p.Qualifiers[i+1:]...)
+		break
+	}
+
+	if len(p.Qualifiers) == 0 {
+		p.Qualifiers = nil
 	}
 
 	return &PackageURL{
 		PackageURL: p,
+		FilePath:   filePath,
 	}, nil
 }
 
-func (p *PackageURL) Package() *ftypes.Package {
-	pkg := &ftypes.Package{
-		Name:    p.Name,
-		Version: p.Version,
-	}
-	for _, q := range p.Qualifiers {
-		switch q.Key {
-		case "arch":
-			pkg.Arch = q.Value
-		case "modularitylabel":
-			pkg.Modularitylabel = q.Value
-		case "epoch":
-			epoch, err := strconv.Atoi(q.Value)
-			if err == nil {
-				pkg.Epoch = epoch
-			}
+// nolint: gocyclo
+func New(t ftypes.TargetType, metadata types.Metadata, pkg ftypes.Package) (*PackageURL, error) {
+	qualifiers := parseQualifier(pkg)
+	pkg.Epoch = 0 // we moved Epoch to qualifiers so we don't need it in version
+
+	ptype := purlType(t)
+	name := pkg.Name
+	ver := utils.FormatVersion(pkg)
+	namespace := ""
+	subpath := ""
+
+	switch ptype {
+	case packageurl.TypeRPM:
+		ns, qs := parseRPM(metadata.OS, pkg.Modularitylabel)
+		namespace = string(ns)
+		qualifiers = append(qualifiers, qs...)
+	case packageurl.TypeDebian:
+		qualifiers = append(qualifiers, parseDeb(metadata.OS)...)
+		if metadata.OS != nil {
+			namespace = string(metadata.OS.Family)
 		}
+	case packageurl.TypeApk:
+		var qs packageurl.Qualifiers
+		name, namespace, qs = parseApk(name, metadata.OS)
+		qualifiers = append(qualifiers, qs...)
+	case packageurl.TypeMaven, string(ftypes.Gradle): // TODO: replace with packageurl.TypeGradle once they add it.
+		namespace, name = parseMaven(name)
+	case packageurl.TypePyPi:
+		name = parsePyPI(name)
+	case packageurl.TypeComposer:
+		namespace, name = parseComposer(name)
+	case packageurl.TypeGolang:
+		namespace, name = parseGolang(name)
+		if name == "" {
+			return nil, nil
+		}
+	case packageurl.TypeNPM:
+		namespace, name = parseNpm(name)
+	case packageurl.TypeSwift:
+		namespace, name = parseSwift(name)
+	case packageurl.TypeCocoapods:
+		name, subpath = parseCocoapods(name)
+	case packageurl.TypeOCI:
+		purl, err := parseOCI(metadata)
+		if err != nil {
+			return nil, err
+		} else if purl.Type == "" {
+			return nil, nil
+		}
+		return &PackageURL{PackageURL: purl}, nil
 	}
 
-	// CocoaPods purl has no namespace, but has subpath
-	// https://github.com/package-url/purl-spec/blob/a748c36ad415c8aeffe2b8a4a5d8a50d16d6d85f/PURL-TYPES.rst#cocoapods
-	if p.Type == packageurl.TypeCocoapods && p.Subpath != "" {
-		// CocoaPods uses <moduleName>/<submoduleName> format for package name
-		// e.g. `pkg:cocoapods/GoogleUtilities@7.5.2#NSData+zlib` => `GoogleUtilities/NSData+zlib`
-		pkg.Name = p.Name + "/" + p.Subpath
-	}
+	return &PackageURL{
+		PackageURL: *packageurl.NewPackageURL(ptype, namespace, name, ver, qualifiers, subpath),
+		FilePath:   pkg.FilePath,
+	}, nil
+}
 
-	if p.Type == packageurl.TypeRPM {
-		rpmVer := version.NewVersion(p.Version)
-		pkg.Release = rpmVer.Release()
-		pkg.Version = rpmVer.Version()
+// WithPath wraps packageurl.PackageURL with the given file path
+func WithPath(purl *packageurl.PackageURL, filePath string) *PackageURL {
+	if purl == nil {
+		return nil
 	}
-
-	// Return packages without namespace.
-	// OS packages are not supposed to have namespace.
-	if p.Namespace == "" || p.Class() == types.ClassOSPkg {
-		return pkg
+	return &PackageURL{
+		PackageURL: *purl,
+		FilePath:   filePath,
 	}
+}
 
-	// TODO: replace with packageurl.TypeGradle once they add it.
-	if p.Type == packageurl.TypeMaven || p.Type == string(ftypes.Gradle) {
-		// Maven and Gradle packages separate ":"
-		// e.g. org.springframework:spring-core
-		pkg.Name = p.Namespace + ":" + p.Name
-	} else {
-		pkg.Name = p.Namespace + "/" + p.Name
+func (p *PackageURL) BOMRef() string {
+	// 'bom-ref' must be unique within BOM, but PURLs may conflict
+	// when the same packages are installed in an artifact.
+	// In that case, we prefer to make PURLs unique by adding file paths,
+	// rather than using UUIDs, even if it is not PURL technically.
+	// ref. https://cyclonedx.org/use-cases/#dependency-graph
+	purl := p.PackageURL // so that it will not override the qualifiers below
+	if p.FilePath != "" {
+		purl.Qualifiers = append(purl.Qualifiers,
+			packageurl.Qualifier{
+				Key:   "file_path",
+				Value: p.FilePath,
+			},
+		)
 	}
+	return purl.String()
+}
 
-	return pkg
+func (p *PackageURL) Unwrap() *packageurl.PackageURL {
+	if p == nil {
+		return nil
+	}
+	return &p.PackageURL
 }
 
 // LangType returns an application type in Trivy
@@ -141,7 +199,7 @@ func (p *PackageURL) LangType() ftypes.LangType {
 		return ftypes.Hex
 	case packageurl.TypeConan:
 		return ftypes.Conan
-	case TypeDart: // TODO: replace with packageurl.TypeDart once they add it.
+	case packageurl.TypePub:
 		return ftypes.Pub
 	case packageurl.TypeBitnami:
 		return ftypes.Bitnami
@@ -180,81 +238,87 @@ func (p *PackageURL) Class() types.ResultClass {
 	}
 }
 
-func (p *PackageURL) BOMRef() string {
-	// 'bom-ref' must be unique within BOM, but PURLs may conflict
-	// when the same packages are installed in an artifact.
-	// In that case, we prefer to make PURLs unique by adding file paths,
-	// rather than using UUIDs, even if it is not PURL technically.
-	// ref. https://cyclonedx.org/use-cases/#dependency-graph
-	purl := p.PackageURL // so that it will not override the qualifiers below
-	if p.FilePath != "" {
-		purl.Qualifiers = append(purl.Qualifiers,
-			packageurl.Qualifier{
-				Key:   "file_path",
-				Value: p.FilePath,
-			},
-		)
+func (p *PackageURL) Package() *ftypes.Package {
+	pkg := &ftypes.Package{
+		Name:    p.Name,
+		Version: p.Version,
+		Identifier: ftypes.PkgIdentifier{
+			PURL: p.Unwrap(),
+		},
 	}
-	return purl.String()
+	for _, q := range p.Qualifiers {
+		switch q.Key {
+		case "arch":
+			pkg.Arch = q.Value
+		case "modularitylabel":
+			pkg.Modularitylabel = q.Value
+		case "epoch":
+			epoch, err := strconv.Atoi(q.Value)
+			if err == nil {
+				pkg.Epoch = epoch
+			}
+		}
+	}
+
+	// CocoaPods purl has no namespace, but has subpath
+	// https://github.com/package-url/purl-spec/blob/a748c36ad415c8aeffe2b8a4a5d8a50d16d6d85f/PURL-TYPES.rst#cocoapods
+	if p.Type == packageurl.TypeCocoapods && p.Subpath != "" {
+		// CocoaPods uses <moduleName>/<submoduleName> format for package name
+		// e.g. `pkg:cocoapods/GoogleUtilities@7.5.2#NSData+zlib` => `GoogleUtilities/NSData+zlib`
+		pkg.Name = p.Name + "/" + p.Subpath
+	}
+
+	if p.Type == packageurl.TypeRPM {
+		rpmVer := version.NewVersion(p.Version)
+		pkg.Release = rpmVer.Release()
+		pkg.Version = rpmVer.Version()
+	}
+
+	// Return packages without namespace.
+	// OS packages are not supposed to have namespace.
+	if p.Namespace == "" || p.Class() == types.ClassOSPkg {
+		return pkg
+	}
+
+	if p.Type == packageurl.TypeMaven || p.Type == packageurl.TypeGradle {
+		// Maven and Gradle packages separate ":"
+		// e.g. org.springframework:spring-core
+		pkg.Name = p.Namespace + ":" + p.Name
+	} else {
+		pkg.Name = p.Namespace + "/" + p.Name
+	}
+
+	return pkg
 }
 
-// nolint: gocyclo
-func NewPackageURL(t ftypes.TargetType, metadata types.Metadata, pkg ftypes.Package) (PackageURL, error) {
-	var qualifiers packageurl.Qualifiers
-	if metadata.OS != nil {
-		qualifiers = parseQualifier(pkg)
-		pkg.Epoch = 0 // we moved Epoch to qualifiers so we don't need it in version
+// Match returns true if the given PURL "target" satisfies the constraint PURL "p".
+// - If the constraint does not have a version, it will match any version in the target.
+// - If the constraint has qualifiers, the target must have the same set of qualifiers to match.
+func (p *PackageURL) Match(target *packageurl.PackageURL) bool {
+	if target == nil {
+		return false
+	}
+	switch {
+	case p.Type != target.Type:
+		return false
+	case p.Namespace != target.Namespace:
+		return false
+	case p.Name != target.Name:
+		return false
+	case p.Version != "" && p.Version != target.Version:
+		return false
+	case p.Subpath != "" && p.Subpath != target.Subpath:
+		return false
 	}
 
-	ptype := purlType(t)
-	name := pkg.Name
-	ver := utils.FormatVersion(pkg)
-	namespace := ""
-	subpath := ""
-
-	switch ptype {
-	case packageurl.TypeRPM:
-		ns, qs := parseRPM(metadata.OS, pkg.Modularitylabel)
-		namespace = string(ns)
-		qualifiers = append(qualifiers, qs...)
-	case packageurl.TypeDebian:
-		qualifiers = append(qualifiers, parseDeb(metadata.OS)...)
-		if metadata.OS != nil {
-			namespace = string(metadata.OS.Family)
+	// All qualifiers in the constraint must be in the target to match
+	q := target.Qualifiers.Map()
+	for k, v1 := range p.Qualifiers.Map() {
+		if v2, ok := q[k]; !ok || v1 != v2 {
+			return false
 		}
-	case packageurl.TypeApk:
-		var qs packageurl.Qualifiers
-		name, namespace, qs = parseApk(name, metadata.OS)
-		qualifiers = append(qualifiers, qs...)
-	case packageurl.TypeMaven, string(ftypes.Gradle): // TODO: replace with packageurl.TypeGradle once they add it.
-		namespace, name = parseMaven(name)
-	case packageurl.TypePyPi:
-		name = parsePyPI(name)
-	case packageurl.TypeComposer:
-		namespace, name = parseComposer(name)
-	case packageurl.TypeGolang:
-		namespace, name = parseGolang(name)
-		if name == "" {
-			return PackageURL{PackageURL: *packageurl.NewPackageURL("", "", "", "", nil, "")}, nil
-		}
-	case packageurl.TypeNPM:
-		namespace, name = parseNpm(name)
-	case packageurl.TypeSwift:
-		namespace, name = parseSwift(name)
-	case packageurl.TypeCocoapods:
-		name, subpath = parseCocoapods(name)
-	case packageurl.TypeOCI:
-		purl, err := parseOCI(metadata)
-		if err != nil {
-			return PackageURL{}, err
-		}
-		return PackageURL{PackageURL: purl}, nil
 	}
-
-	return PackageURL{
-		PackageURL: *packageurl.NewPackageURL(ptype, namespace, name, ver, qualifiers, subpath),
-		FilePath:   pkg.FilePath,
-	}, nil
+	return true
 }
 
 // ref. https://github.com/package-url/purl-spec/blob/a748c36ad415c8aeffe2b8a4a5d8a50d16d6d85f/PURL-TYPES.rst#oci
@@ -410,7 +474,7 @@ func purlType(t ftypes.TargetType) string {
 		return packageurl.TypeMaven
 	case ftypes.Bundler, ftypes.GemSpec:
 		return packageurl.TypeGem
-	case ftypes.NuGet, ftypes.DotNetCore:
+	case ftypes.NuGet, ftypes.DotNetCore, ftypes.PackagesProps:
 		return packageurl.TypeNuget
 	case ftypes.CondaPkg:
 		return packageurl.TypeConda
@@ -429,7 +493,7 @@ func purlType(t ftypes.TargetType) string {
 	case ftypes.Conan:
 		return packageurl.TypeConan
 	case ftypes.Pub:
-		return TypeDart // TODO: replace with packageurl.TypeDart once they add it.
+		return packageurl.TypePub
 	case ftypes.RustBinary, ftypes.Cargo:
 		return packageurl.TypeCargo
 	case ftypes.Alpine:
@@ -447,7 +511,7 @@ func purlType(t ftypes.TargetType) string {
 }
 
 func parseQualifier(pkg ftypes.Package) packageurl.Qualifiers {
-	qualifiers := packageurl.Qualifiers{}
+	var qualifiers packageurl.Qualifiers
 	if pkg.Arch != "" {
 		qualifiers = append(qualifiers, packageurl.Qualifier{
 			Key:   "arch",
@@ -460,6 +524,7 @@ func parseQualifier(pkg ftypes.Package) packageurl.Qualifiers {
 			Value: strconv.Itoa(pkg.Epoch),
 		})
 	}
+
 	return qualifiers
 }
 

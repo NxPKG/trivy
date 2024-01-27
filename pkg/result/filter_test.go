@@ -2,6 +2,7 @@ package result_test
 
 import (
 	"context"
+	"github.com/package-url/packageurl-go"
 	"testing"
 	"time"
 
@@ -150,9 +151,16 @@ func TestFilter(t *testing.T) {
 						types.Result{
 							Vulnerabilities: []types.DetectedVulnerability{
 								{
-									VulnerabilityID:  "CVE-2019-0001",
-									PkgName:          "foo",
-									PkgRef:           "pkg:golang/github.com/aquasecurity/foo@1.2.3",
+									VulnerabilityID: "CVE-2019-0001",
+									PkgName:         "foo",
+									PkgIdentifier: ftypes.PkgIdentifier{
+										PURL: &packageurl.PackageURL{
+											Type:      packageurl.TypeGolang,
+											Namespace: "github.com/aquasecurity",
+											Name:      "foo",
+											Version:   "1.2.3",
+										},
+									},
 									InstalledVersion: "1.2.3",
 									FixedVersion:     "1.2.4",
 									Vulnerability: dbTypes.Vulnerability{
@@ -160,11 +168,18 @@ func TestFilter(t *testing.T) {
 									},
 								},
 								{
-									VulnerabilityID:  "CVE-2019-0001",
-									PkgName:          "bar",
-									PkgRef:           "pkg:golang/github.com/aquasecurity/bar@1.2.3",
-									InstalledVersion: "1.2.3",
-									FixedVersion:     "1.2.4",
+									VulnerabilityID: "CVE-2019-0001",
+									PkgName:         "bar",
+									PkgIdentifier: ftypes.PkgIdentifier{
+										PURL: &packageurl.PackageURL{
+											Type:      packageurl.TypeGolang,
+											Namespace: "github.com/aquasecurity",
+											Name:      "bar",
+											Version:   "4.5.6",
+										},
+									},
+									InstalledVersion: "4.5.6",
+									FixedVersion:     "4.5.7",
 									Vulnerability: dbTypes.Vulnerability{
 										Severity: dbTypes.SeverityCritical.String(),
 									},
@@ -187,11 +202,18 @@ func TestFilter(t *testing.T) {
 					types.Result{
 						Vulnerabilities: []types.DetectedVulnerability{
 							{
-								VulnerabilityID:  "CVE-2019-0001",
-								PkgName:          "bar",
-								PkgRef:           "pkg:golang/github.com/aquasecurity/bar@1.2.3",
-								InstalledVersion: "1.2.3",
-								FixedVersion:     "1.2.4",
+								VulnerabilityID: "CVE-2019-0001",
+								PkgName:         "bar",
+								PkgIdentifier: ftypes.PkgIdentifier{
+									PURL: &packageurl.PackageURL{
+										Type:      packageurl.TypeGolang,
+										Namespace: "github.com/aquasecurity",
+										Name:      "bar",
+										Version:   "4.5.6",
+									},
+								},
+								InstalledVersion: "4.5.6",
+								FixedVersion:     "4.5.7",
 								Vulnerability: dbTypes.Vulnerability{
 									Severity: dbTypes.SeverityCritical.String(),
 								},
@@ -383,6 +405,11 @@ func TestFilter(t *testing.T) {
 					{
 						Target: "Dockerfile",
 						Class:  types.ClassConfig,
+						MisconfSummary: &types.MisconfSummary{
+							Successes:  0,
+							Failures:   0,
+							Exceptions: 1,
+						},
 					},
 					{
 						Secrets: []ftypes.SecretFinding{
@@ -584,7 +611,7 @@ func TestFilter(t *testing.T) {
 						MisconfSummary: &types.MisconfSummary{
 							Successes:  0,
 							Failures:   1,
-							Exceptions: 0,
+							Exceptions: 2,
 						},
 						Misconfigurations: []types.DetectedMisconfiguration{
 							{
@@ -679,6 +706,67 @@ func TestFilter(t *testing.T) {
 								Vulnerability: dbTypes.Vulnerability{
 									Severity: dbTypes.SeverityLow.String(),
 								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ignore file for misconf",
+			args: args{
+				report: types.Report{
+					Results: types.Results{
+						{
+							Misconfigurations: []types.DetectedMisconfiguration{
+								{
+									ID:          "AVD-TEST-0001",
+									AVDID:       "AVD-TEST-0001",
+									Title:       "test-0001",
+									Description: "foo",
+									Severity:    dbTypes.SeverityHigh.String(),
+									Status:      types.StatusFailure,
+								},
+								{
+									ID:          "AVD-TEST-0002",
+									AVDID:       "AVD-TEST-0002",
+									Title:       "test-0002",
+									Description: "bar",
+									Severity:    dbTypes.SeverityHigh.String(),
+									Status:      types.StatusPassed,
+								},
+								{
+									// this misconf is ignored
+									ID:          "AVD-TEST-0003",
+									AVDID:       "AVD-TEST-0003",
+									Title:       "test-0003",
+									Description: "baz",
+									Severity:    dbTypes.SeverityHigh.String(),
+									Status:      types.StatusFailure,
+								},
+							},
+						},
+					},
+				},
+				severities: []dbTypes.Severity{dbTypes.SeverityHigh},
+				policyFile: "./testdata/test-ignore-policy-misconf.rego",
+			},
+			want: types.Report{
+				Results: types.Results{
+					{
+						MisconfSummary: &types.MisconfSummary{
+							Successes:  1,
+							Failures:   2,
+							Exceptions: 1,
+						},
+						Misconfigurations: []types.DetectedMisconfiguration{
+							{
+								ID:          "AVD-TEST-0001",
+								AVDID:       "AVD-TEST-0001",
+								Title:       "test-0001",
+								Description: "foo",
+								Severity:    dbTypes.SeverityHigh.String(),
+								Status:      types.StatusFailure,
 							},
 						},
 					},
@@ -978,9 +1066,9 @@ func TestFilter(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeTime := time.Date(2020, 8, 10, 7, 28, 17, 958601, time.UTC)
-			clock.SetFakeTime(t, fakeTime)
+			ctx := clock.With(context.Background(), fakeTime)
 
-			err := result.Filter(context.Background(), tt.args.report, result.FilterOption{
+			err := result.Filter(ctx, tt.args.report, result.FilterOption{
 				Severities:     tt.args.severities,
 				VEXPath:        tt.args.vexPath,
 				IgnoreStatuses: tt.args.ignoreStatuses,
